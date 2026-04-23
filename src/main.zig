@@ -1,8 +1,12 @@
-// This is the entry point for zLLM, a Metal-accelerated inference engine.
 const std = @import("std");
+const metal = @import("metal.zig");
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
+    _ = init;
+    std.debug.print("zLLM starting (debug)...\n", .{});
 
-    try std.Io.File.stdout().writeStreamingAll(io, "zLLM starting...\n");
+    const dev = try metal.Device.init();
+    defer dev.deinit();
+
+    std.debug.print("Metal Device: {s}\n", .{dev.getName()});
 }
