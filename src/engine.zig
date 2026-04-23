@@ -54,10 +54,10 @@ pub const Engine = struct {
         for (model.tensors) |t| {
             const offset = model.data_offset + t.offset;
             const size = try getTensorSize(t.type, t.dimensions);
-            
+
             if (offset + size > mmap_buffer.len) return error.TensorOutOfBounds;
-            
-            const buf = try device.createBuffer(mmap_buffer[offset..offset+size], size);
+
+            const buf = try device.createBuffer(mmap_buffer[offset .. offset + size], size);
             try tensors.put(allocator, t.name.data, buf);
         }
 

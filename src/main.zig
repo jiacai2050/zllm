@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
-    
+
     try stdout.interface.print("--- zLLM Inference Engine ---\n", .{});
     try stdout.interface.print("Loading model: {s}\n", .{model_path});
 
@@ -72,12 +72,12 @@ pub fn main(init: std.process.Init) !void {
     var line_buf: [1024]u8 = undefined;
     var in_buf: [1024]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(io, &in_buf);
-    
+
     while (true) {
         try stdout.interface.print("> ", .{});
         // Flush stdout
         try stdout.flush();
-        
+
         const line = try readLine(&stdin.interface, &line_buf) orelse break;
         const trimmed = std.mem.trim(u8, line, " \r\n");
         if (trimmed.len == 0) continue;
@@ -85,9 +85,9 @@ pub fn main(init: std.process.Init) !void {
 
         try stdout.interface.print("zLLM: (Thinking...)\n", .{});
         try stdout.flush();
-        
+
         // Placeholder for forward pass
-        _ = try e.forward(&.{1}); 
+        _ = try e.forward(&.{1});
         try stdout.interface.print("zLLM: Quantization support is active. Matmul Q4_K is ready in shaders.\n", .{});
         try stdout.flush();
     }

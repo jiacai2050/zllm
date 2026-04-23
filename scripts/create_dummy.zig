@@ -6,7 +6,7 @@ pub fn main(init: std.process.Init) !void {
     defer file.close(io);
 
     try file.writeStreamingAll(io, "GGUF");
-    
+
     var buf4: [4]u8 = undefined;
     var buf8: [8]u8 = undefined;
 
