@@ -1,0 +1,11 @@
+.{
+    .name = .zllm,
+    .version = "0.1.0",
+    .fingerprint = 0x9e4094ee8e99e047,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
