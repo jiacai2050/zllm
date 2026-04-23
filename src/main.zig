@@ -122,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
         // Prefill
         for (ids) |token| {
             const logits = try e.forward(token, pos);
+            std.debug.print("Logits[0..5]: {d:.4}, {d:.4}, {d:.4}, {d:.4}, {d:.4}\n", .{logits[0], logits[1], logits[2], logits[3], logits[4]});
             current_token = sampler.sampleArgmax(logits);
             pos += 1;
         }
@@ -172,6 +173,7 @@ pub fn main(init: std.process.Init) !void {
         // Prefill
         for (ids) |token| {
             const logits = try e.forward(token, pos);
+            std.debug.print("Logits[0..5]: {d:.4}, {d:.4}, {d:.4}, {d:.4}, {d:.4}\n", .{logits[0], logits[1], logits[2], logits[3], logits[4]});
             current_token = sampler.sampleArgmax(logits);
             pos += 1;
         }
