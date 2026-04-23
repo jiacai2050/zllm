@@ -60,3 +60,56 @@ kernel void matmul_q4_K(
     }
     dst[i] = sum;
 }
+
+kernel void rope(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint32_t& pos [[buffer(2)]],
+    constant uint32_t& head_dim [[buffer(3)]],
+    constant float& freq_base [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    uint32_t half_dim = head_dim / 2;
+    uint32_t head_idx = i / half_dim;
+    uint32_t j = i % half_dim;
+
+    float theta = pow(freq_base, -((float)(2 * j) / (float)head_dim));
+    float m_theta = (float)pos * theta;
+    float cos_t = cos(m_theta);
+    float sin_t = sin(m_theta);
+
+    uint32_t idx0 = head_idx * head_dim + j;
+    uint32_t idx1 = head_idx * head_dim + j + half_dim;
+
+    float x0 = src[idx0];
+    float x1 = src[idx1];
+
+    dst[idx0] = x0 * cos_t - x1 * sin_t;
+    dst[idx1] = x0 * sin_t + x1 * cos_t;
+}
+
+kernel void swiglu(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* dst [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    float val = x[i];
+    float silu = val / (1.0f + exp(-val));
+    dst[i] = silu * y[i];
+}
+
+kernel void matmul_f32(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* dst [[buffer(2)]],
+    constant uint32_t& ncols [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    float sum = 0.0f;
+    device const float* row = x + i * ncols;
+    for (uint32_t j = 0; j < ncols; j++) {
+        sum += row[j] * y[j];
+    }
+    dst[i] = sum;
+}
