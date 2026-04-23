@@ -43,10 +43,21 @@ kernel void embed_q5_0(
     float d = (float)(*(device const half*)b);
     uint32_t qh = b[2] | (b[3] << 8) | (b[4] << 16) | (b[5] << 24);
     device const uint8_t* qs = b + 6;
-    uint8_t q = qs[k % 16];
-    uint8_t bits = (k < 16) ? (q & 0x0F) : (q >> 4);
+    uint8_t q_val = qs[k % 16];
+    uint8_t bits = (k < 16) ? (q_val & 0x0F) : (q_val >> 4);
     if (qh & (1U << k)) bits |= 0x10;
     dst[i] = d * ((float)bits - 16.0f);
+}
+
+kernel void embed_f16(
+    device const uint32_t* tokens [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    device const half* embeddings [[buffer(2)]],
+    constant uint32_t& dim [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    uint32_t token = tokens[0];
+    dst[i] = (float)embeddings[token * dim + i];
 }
 
 kernel void embed_f32(
@@ -99,8 +110,8 @@ kernel void matmul_q5_0(
         uint32_t qh = b[2] | (b[3] << 8) | (b[4] << 16) | (b[5] << 24);
         device const uint8_t* qs = b + 6;
         for (uint32_t k = 0; k < 32; k++) {
-            uint8_t q = qs[k % 16];
-            uint8_t bits = (k < 16) ? (q & 0x0F) : (q >> 4);
+            uint8_t q_val = qs[k % 16];
+            uint8_t bits = (k < 16) ? (q_val & 0x0F) : (q_val >> 4);
             if (qh & (1U << k)) bits |= 0x10;
             sum += y[j * 32 + k] * d * ((float)bits - 16.0f);
         }
@@ -123,9 +134,9 @@ kernel void matmul_q4_0(
         const float d = (float)(*(device const half*)b);
         device const uint8_t* qs = b + 2;
         for (uint32_t k = 0; k < 16; k++) {
-            uint8_t q = qs[k];
-            sum += y[j * 32 + k] * d * ((float)(q & 0x0F) - 8.0f);
-            sum += y[j * 32 + k + 16] * d * ((float)(q >> 4) - 8.0f);
+            uint8_t q_val = qs[k];
+            sum += y[j * 32 + k] * d * ((float)(q_val & 0x0F) - 8.0f);
+            sum += y[j * 32 + k + 16] * d * ((float)(q_val >> 4) - 8.0f);
         }
     }
     dst[i] = sum;
@@ -145,12 +156,22 @@ kernel void matmul_q4_K(
         device const uint8_t* b = row + j * 144;
         float d = (float)(*(device const half*)b);
         float dmin = (float)(*(device const half*)(b + 2));
+        device const uint8_t* scales = b + 4;
         device const uint8_t* qs = b + 16;
-        for (uint32_t k = 0; k < 256; k++) {
-            uint8_t q;
-            if (k < 128) q = qs[k] & 0x0F;
-            else q = qs[k - 128] >> 4;
-            sum += y[j * 256 + k] * (d * q - dmin);
+        for (uint32_t g = 0; g < 8; g++) {
+            uint8_t sc, m;
+            if (g < 4) {
+                sc = scales[g] & 63;
+                m  = scales[g+4] & 63;
+            } else {
+                sc = (scales[g+4] & 0xF) | ((scales[g-4] >> 6) << 4);
+                m  = (scales[g+4] >> 4) | ((scales[g] >> 6) << 4);
+            }
+            for (uint32_t k = 0; k < 32; k++) {
+                uint32_t idx = g * 32 + k;
+                uint8_t q_val = (idx < 128) ? (qs[idx] & 0x0F) : (qs[idx - 128] >> 4);
+                sum += y[j * 256 + idx] * (d * q_val * sc - dmin * m);
+            }
         }
     }
     dst[i] = sum;
@@ -168,12 +189,27 @@ kernel void matmul_q6_K(
     device const uint8_t* row = x + i * nb * 210;
     for (uint32_t j = 0; j < nb; j++) {
         device const uint8_t* b = row + j * 210;
-        device const uint8_t* ql = b;
         float d = (float)(*(device const half*)(b + 208));
+        device const uint8_t* ql = b;
         for (uint32_t k = 0; k < 256; k++) {
-            int8_t q = (k < 128) ? (ql[k] & 0xF) : (ql[k - 128] >> 4);
-            sum += y[j * 256 + k] * d * (float)(q - 32);
+            int8_t q_val = (k < 128) ? (ql[k] & 0xF) : (ql[k - 128] >> 4);
+            sum += y[j * 256 + k] * d * (float)(q_val - 32);
         }
+    }
+    dst[i] = sum;
+}
+
+kernel void matmul_f16(
+    device const half* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* dst [[buffer(2)]],
+    constant uint32_t& ncols [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    float sum = 0.0f;
+    device const half* row = x + i * ncols;
+    for (uint32_t j = 0; j < ncols; j++) {
+        sum += (float)row[j] * y[j];
     }
     dst[i] = sum;
 }
@@ -223,13 +259,12 @@ kernel void update_kv_cache(
     device float* k_cache [[buffer(2)]],
     device float* v_cache [[buffer(3)]],
     constant uint32_t& pos [[buffer(4)]],
-    constant uint32_t& n_layer [[buffer(5)]], // actually ilayer
+    constant uint32_t& ilayer [[buffer(5)]],
     constant uint32_t& n_head_kv [[buffer(6)]],
     constant uint32_t& head_dim [[buffer(7)]],
     constant uint32_t& context_len [[buffer(8)]],
     uint i [[thread_position_in_grid]]
 ) {
-    uint32_t ilayer = n_layer;
     uint32_t n_embd_kv = n_head_kv * head_dim;
     uint32_t cache_layer_offset = ilayer * n_embd_kv * context_len;
     k_cache[cache_layer_offset + pos * n_embd_kv + i] = k[i];
@@ -252,11 +287,8 @@ kernel void attention(
     uint32_t n_embd_kv = n_head_kv * head_dim;
     uint32_t cache_layer_offset = ilayer * n_embd_kv * context_len;
     uint32_t kv_head_idx = ihead / (n_head / n_head_kv);
-    
     device const float* head_q = q + ihead * head_dim;
-    
-    // 1. Q * K^T
-    float scores[512]; // Limited to context_len 512
+    float scores[512]; 
     float max_score = -1e20f;
     for (uint p = 0; p <= pos; p++) {
         float sum = 0.0f;
@@ -268,15 +300,11 @@ kernel void attention(
         scores[p] = sum;
         if (sum > max_score) max_score = sum;
     }
-    
-    // 2. Softmax
     float sum_exp = 0.0f;
     for (uint p = 0; p <= pos; p++) {
         scores[p] = exp(scores[p] - max_score);
         sum_exp += scores[p];
     }
-    
-    // 3. Score * V
     for (uint d = 0; d < head_dim; d++) {
         float val = 0.0f;
         for (uint p = 0; p <= pos; p++) {

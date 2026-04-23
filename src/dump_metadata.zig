@@ -29,11 +29,11 @@ pub fn main(init: std.process.Init) !void {
     for (0..header.metadata_kv_count) |_| {
         const kv = try gguf.MetadataKV.parse(&reader, allocator);
         defer kv.deinit(allocator);
-        
+
         if (std.mem.eql(u8, kv.key.data, "tokenizer.ggml.tokens")) {
             std.debug.print("First 10 tokens:\n", .{});
             for (kv.value.array.data[0..10], 0..) |v, i| {
-                std.debug.print("  {d}: {s}\n", .{i, v.string.data});
+                std.debug.print("  {d}: {s}\n", .{ i, v.string.data });
             }
         }
     }

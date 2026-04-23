@@ -46,7 +46,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Model {
         tensors[i] = try parseTensorInfo(reader, allocator);
     }
 
-    // Default alignment is 32
+    // Default alignment for tensor data is 32 bytes.
     var alignment: u64 = 32;
     for (metadata) |kv| {
         if (std.mem.eql(u8, kv.key.data, "general.alignment")) {
@@ -58,9 +58,13 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Model {
         }
     }
 
-    // data_offset is the current position in the reader, aligned to alignment
-    const current_pos = reader.seek;
-    const data_offset = (current_pos + alignment - 1) & ~(alignment - 1);
+    // Ensure the alignment is a power of two for efficient bitwise operations.
+    std.debug.assert(alignment > 0);
+    std.debug.assert((alignment & (alignment - 1)) == 0);
+
+    // Calculate the data offset from the current reader position, aligned to the specified alignment.
+    const current_position = reader.seek;
+    const data_offset = (current_position + alignment - 1) & ~(alignment - 1);
 
     return Model{
         .header = header,

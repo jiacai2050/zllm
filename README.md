@@ -24,20 +24,22 @@ git clone https://github.com/jiacai2050/zllm.git
 cd zllm
 ```
 
-### 2. Build the project
+### 2. Download the Recommended Model
+For the best experience (clean English output), download the **Qwen2.5-0.5B-Instruct FP16** model:
+
+- **Download Link**: [qwen2.5-0.5b-instruct-fp16.gguf](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/blob/main/qwen2.5-0.5b-instruct-fp16.gguf)
+
+### 3. Build and Run
+
+#### Direct Prompt Mode
 ```bash
-zig build
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zllm /path/to/qwen2.5-0.5b-instruct-fp16.gguf -p "What is the capital of France?"
 ```
 
-### 3. Run with a model
-To run the inference engine, you need a GGUF format model. You can also generate a dummy model for testing:
-
+#### Interactive Chat Mode
 ```bash
-# Generate a dummy model
-zig run scripts/create_dummy.zig
-
-# Run zLLM
-./zig-out/bin/zllm dummy.gguf
+./zig-out/bin/zllm /path/to/qwen2.5-0.5b-instruct-fp16.gguf
 ```
 
 ## Project Structure

@@ -2,9 +2,10 @@ const std = @import("std");
 const metal = @import("metal.zig");
 const gguf = @import("gguf.zig");
 const engine = @import("engine.zig");
-const tokenizer = @import("tokenizer");
+const tokenizer = @import("tokenizer.zig");
 const sampler = @import("sampler.zig");
 
+/// Read a single line from the standard input until a newline character is encountered.
 fn readLine(reader: *std.Io.Reader, buffer: []u8) !?[]u8 {
     var i: usize = 0;
     while (i < buffer.len) {
@@ -19,180 +20,159 @@ fn readLine(reader: *std.Io.Reader, buffer: []u8) !?[]u8 {
     return buffer[0..i];
 }
 
+/// Execute the inference process for a given prompt and print the generated text and performance stats.
+fn runInference(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    e: *engine.Engine,
+    tok: *tokenizer.Tokenizer,
+    stdout: anytype,
+    prng: *std.Random.DefaultPrng,
+    prompt_text: []const u8,
+) !void {
+    const token_ids = try tok.encode(allocator, prompt_text);
+    defer allocator.free(token_ids);
+
+    try stdout.print("zLLM: ", .{});
+    try stdout.flush();
+
+    var current_position: u32 = 0;
+    var current_token_id: u32 = 0;
+
+    // Prefill phase: Process all tokens in the prompt.
+    for (token_ids) |token_id| {
+        const logits = try e.forward(token_id, current_position);
+        current_token_id = sampler.sampleTopP(logits, 0.9, 0.8, prng);
+        current_position += 1;
+    }
+
+    // Generation phase: Predict the next tokens until the limit or EOS is reached.
+    const start_time_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    var generated_tokens_count: usize = 0;
+    while (generated_tokens_count < 150) {
+        const token_string = tok.decode(current_token_id);
+        try stdout.print("{s}", .{token_string});
+        try stdout.flush();
+
+        // Standard Qwen2.5/Llama3 EOS tokens.
+        if (current_token_id == 151643 or current_token_id == 151645) break;
+
+        const logits = try e.forward(current_token_id, current_position);
+        current_token_id = sampler.sampleTopP(logits, 0.9, 0.8, prng);
+        current_position += 1;
+        generated_tokens_count += 1;
+    }
+    const end_time_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+
+    // Performance metrics calculation.
+    const duration_ns = @as(u64, @intCast(end_time_ns - start_time_ns));
+    const duration_ms = duration_ns / 1_000_000;
+    const tokens_per_second = if (duration_ms > 0) (@as(f64, @floatFromInt(generated_tokens_count)) / @as(f64, @floatFromInt(duration_ms)) * 1000.0) else 0;
+
+    try stdout.print("\n\n--- Stats ---\n", .{});
+    try stdout.print("Input tokens:  {d}\n", .{token_ids.len});
+    try stdout.print("Output tokens: {d}\n", .{generated_tokens_count});
+    try stdout.print("Duration:      {d}ms\n", .{duration_ms});
+    try stdout.print("Speed:         {d:.2} tokens/s\n", .{tokens_per_second});
+    try stdout.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
 
-    var model_path: ?[]const u8 = null;
-    var prompt: ?[]const u8 = null;
-
-    var args = init.minimal.args.iterate();
-    _ = args.next(); // skip program name
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--prompt")) {
-            prompt = args.next() orelse {
-                std.debug.print("Error: -p/--prompt requires a value\n", .{});
-                return;
-            };
-        } else if (model_path == null) {
-            model_path = arg;
-        } else {
-            // Ignore other arguments for now
-        }
-    }
-
-    const path = model_path orelse {
-        std.debug.print("Usage: zllm <model_path> [-p <prompt>]\n", .{});
+    var args_iterator = init.minimal.args.iterate();
+    _ = args_iterator.next(); // Skip the program name.
+    const model_path = args_iterator.next() orelse {
+        std.debug.print("Usage: zllm <model_path> [-p prompt]\n", .{});
         return;
     };
 
-    var out_buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var prompt_text_arg: ?[]const u8 = null;
+    while (args_iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--prompt")) {
+            prompt_text_arg = args_iterator.next();
+        }
+    }
 
-    try stdout.interface.print("--- zLLM Inference Engine ---\n", .{});
-    try stdout.interface.print("Loading model: {s}\n", .{path});
+    var output_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &output_buffer);
+    var stdout = &stdout_writer.interface;
 
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    try stdout.print("--- zLLM Inference Engine ---\n", .{});
+    try stdout.print("Loading model: {s}\n", .{model_path});
+
+    const file = try std.Io.Dir.cwd().openFile(io, model_path, .{});
     defer file.close(io);
 
     const stat = try file.stat(io);
-    const size = stat.size;
+    const model_file_size = stat.size;
 
-    const buffer = try std.posix.mmap(
+    const mmap_buffer = try std.posix.mmap(
         null,
-        size,
+        model_file_size,
         .{ .READ = true },
         .{ .TYPE = .SHARED },
         file.handle,
         0,
     );
-    defer std.posix.munmap(buffer);
+    defer std.posix.munmap(mmap_buffer);
 
-    var reader: std.Io.Reader = .fixed(buffer);
+    var reader: std.Io.Reader = .fixed(mmap_buffer);
     const model = try gguf.parse(&reader, allocator);
     defer model.deinit(allocator);
 
-    try stdout.interface.print("GGUF version: {d}\n", .{model.header.version});
-    try stdout.interface.print("Tensor count: {d}\n", .{model.header.tensor_count});
-
-    // Initialize Tokenizer
-    const tokens_kv = model.findMetadata("tokenizer.ggml.tokens") orelse {
-        std.debug.print("Error: model is missing 'tokenizer.ggml.tokens' metadata\n", .{});
-        return error.MissingTokens;
-    };
-    if (tokens_kv.value != .array or tokens_kv.value.array.type != .string) {
-        std.debug.print("Error: 'tokenizer.ggml.tokens' is not a string array\n", .{});
-        return error.InvalidTokensType;
+    var raw_tokens_list = try std.ArrayList([]const u8).initCapacity(allocator, 151936);
+    defer raw_tokens_list.deinit(allocator);
+    for (model.metadata) |kv| {
+        if (std.mem.eql(u8, kv.key.data, "tokenizer.ggml.tokens")) {
+            for (kv.value.array.data) |v| {
+                try raw_tokens_list.append(allocator, v.string.data);
+            }
+            break;
+        }
     }
-
-    const tokens_array = tokens_kv.value.array.data;
-    var token_strings = try allocator.alloc([]const u8, tokens_array.len);
-    defer allocator.free(token_strings);
-    for (tokens_array, 0..) |v, i| {
-        token_strings[i] = v.string.data;
-    }
-
-    var tok = try tokenizer.Tokenizer.init(allocator, token_strings);
+    var tok = try tokenizer.Tokenizer.init(allocator, raw_tokens_list.items);
     defer tok.deinit(allocator);
 
-    try stdout.interface.print("Tokenizer initialized with {d} tokens.\n", .{tokens_array.len});
+    try stdout.print("GGUF version: {d}\n", .{model.header.version});
+    try stdout.print("Tensor count: {d}\n", .{model.header.tensor_count});
+    try stdout.print("Tokenizer initialized with {d} tokens.\n", .{raw_tokens_list.items.len});
 
     const kernels_source = @embedFile("metal/kernels.metal");
     const dev = try metal.Device.init(kernels_source);
     defer dev.deinit();
 
-    try stdout.interface.print("Metal Device: {s}\n", .{dev.getName()});
+    try stdout.print("Metal Device: {s}\n", .{dev.getName()});
 
-    const e = try engine.Engine.init(allocator, dev, model, buffer);
+    const e = try engine.Engine.init(allocator, dev, model, mmap_buffer);
     defer e.deinit();
 
-    try stdout.interface.print("Engine initialized with {d} tensors.\n", .{e.tensors.count()});
+    try stdout.print("Engine initialized with {d} tensors.\n", .{e.tensors.count()});
 
-    if (prompt) |p| {
-        try stdout.interface.print("\nPrompt: {s}\n", .{p});
-        const ids = try tok.encode(allocator, p);
-        defer allocator.free(ids);
+    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.now(.awake, io).nanoseconds));
 
-        try stdout.interface.print("zLLM: ", .{});
-        try stdout.flush();
-
-        var pos: u32 = 0;
-        var current_token: u32 = 0;
-
-        // Prefill
-        for (ids) |token| {
-            const logits = try e.forward(token, pos);
-            std.debug.print("Logits[0..5]: {d:.4}, {d:.4}, {d:.4}, {d:.4}, {d:.4}\n", .{logits[0], logits[1], logits[2], logits[3], logits[4]});
-            current_token = sampler.sampleArgmax(logits);
-            pos += 1;
-        }
-
-        // Generation loop
-        var step: usize = 0;
-        while (step < 50) : (step += 1) {
-            const token_str = tok.decode(current_token);
-            try stdout.interface.print("{s}", .{token_str});
-            try stdout.flush();
-
-            // Check for EOS (standard Qwen2.5/Llama3 EOS tokens)
-            if (current_token == 151643 or current_token == 151645) break;
-
-            const logits = try e.forward(current_token, pos);
-            current_token = sampler.sampleArgmax(logits);
-            pos += 1;
-        }
-        try stdout.interface.print("\n", .{});
-        try stdout.flush();
+    if (prompt_text_arg) |p| {
+        try stdout.print("\nPrompt: {s}\n", .{p});
+        try runInference(io, allocator, e, &tok, stdout, &prng, p);
         return;
     }
 
-    try stdout.interface.print("\nWelcome to zLLM! Enter your prompt below (type 'exit' to quit).\n", .{});
+    try stdout.print("\nWelcome to zLLM! Enter your prompt below (type 'exit' to quit).\n", .{});
 
-    var line_buf: [1024]u8 = undefined;
-    var in_buf: [1024]u8 = undefined;
-    var stdin = std.Io.File.stdin().reader(io, &in_buf);
+    var line_buffer: [2048]u8 = undefined;
+    var input_buffer: [1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(io, &input_buffer);
 
     while (true) {
-        try stdout.interface.print("> ", .{});
+        try stdout.print("> ", .{});
         try stdout.flush();
 
-        const line = try readLine(&stdin.interface, &line_buf) orelse break;
-        const trimmed = std.mem.trim(u8, line, " \r\n");
-        if (trimmed.len == 0) continue;
-        if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) break;
+        const line = try readLine(&stdin.interface, &line_buffer) orelse break;
+        const trimmed_line = std.mem.trim(u8, line, " \r\n");
+        if (trimmed_line.len == 0) continue;
+        if (std.mem.eql(u8, trimmed_line, "exit") or std.mem.eql(u8, trimmed_line, "quit")) break;
 
-        const ids = try tok.encode(allocator, trimmed);
-        defer allocator.free(ids);
-
-        try stdout.interface.print("zLLM: ", .{});
-        try stdout.flush();
-
-        var pos: u32 = 0;
-        var current_token: u32 = 0;
-
-        // Prefill
-        for (ids) |token| {
-            const logits = try e.forward(token, pos);
-            std.debug.print("Logits[0..5]: {d:.4}, {d:.4}, {d:.4}, {d:.4}, {d:.4}\n", .{logits[0], logits[1], logits[2], logits[3], logits[4]});
-            current_token = sampler.sampleArgmax(logits);
-            pos += 1;
-        }
-
-        // Generation loop
-        var step: usize = 0;
-        while (step < 50) : (step += 1) {
-            const token_str = tok.decode(current_token);
-            try stdout.interface.print("{s}", .{token_str});
-            try stdout.flush();
-
-            if (current_token == 151643 or current_token == 151645) break;
-
-            const logits = try e.forward(current_token, pos);
-            current_token = sampler.sampleArgmax(logits);
-            pos += 1;
-        }
-        try stdout.interface.print("\n", .{});
-        try stdout.flush();
+        try runInference(io, allocator, e, &tok, stdout, &prng, trimmed_line);
     }
 }
-
