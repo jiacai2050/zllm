@@ -67,6 +67,25 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_metal_tests = b.addRunArtifact(metal_tests);
-    const test_step = b.step("test", "Run metal tests");
+    const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_metal_tests.step);
+
+    // GGUF module and tests
+    const gguf_module = b.createModule(.{
+        .root_source_file = b.path("src/gguf.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const gguf_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/gguf_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gguf_tests.root_module.addImport("gguf", gguf_module);
+
+    const run_gguf_tests = b.addRunArtifact(gguf_tests);
+    test_step.dependOn(&run_gguf_tests.step);
 }
