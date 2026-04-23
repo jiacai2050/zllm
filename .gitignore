@@ -10,9 +10,5 @@ zig-pkg/
 build/
 build-*/
 docgen_tmp/
-
-# End of https://www.toptal.com/developers/gitignore/api/zig
-
-.superpowers/.worktrees/
+.superpowers/
 .zig-cache/
-zig-out/
