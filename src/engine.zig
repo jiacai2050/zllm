@@ -2,6 +2,39 @@ const std = @import("std");
 const metal = @import("metal.zig");
 const gguf = @import("gguf.zig");
 
+pub const GGMLType = enum(u32) {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
+};
+
+fn getTensorSize(dtype: u32, dims: []u64) !u64 {
+    var elements: u64 = 1;
+    for (dims) |d| elements *= d;
+
+    const ggml_type = std.enums.fromInt(GGMLType, dtype) orelse .F32;
+    return switch (ggml_type) {
+        .F32 => elements * 4,
+        .F16 => elements * 2,
+        .Q4_K => {
+            if (elements % 256 != 0) return error.InvalidQuantizedDimensions;
+            return (elements / 256) * 144;
+        },
+        else => elements * 4,
+    };
+}
+
 pub const Engine = struct {
     device: *metal.Device,
     model: gguf.Model,
@@ -20,12 +53,7 @@ pub const Engine = struct {
 
         for (model.tensors) |t| {
             const offset = model.data_offset + t.offset;
-            
-            var elements: u64 = 1;
-            for (t.dimensions) |d| elements *= d;
-            
-            // TODO: Proper size calculation for quantized types
-            const size = elements * 4; // assume f32 for now
+            const size = try getTensorSize(t.type, t.dimensions);
             
             if (offset + size > mmap_buffer.len) return error.TensorOutOfBounds;
             
