@@ -9,6 +9,15 @@ pub const Model = struct {
     tensors: []TensorInfo,
     data_offset: u64,
 
+    pub fn findMetadata(self: Model, key: []const u8) ?MetadataKV {
+        for (self.metadata) |kv| {
+            if (std.mem.eql(u8, kv.key.data, key)) {
+                return kv;
+            }
+        }
+        return null;
+    }
+
     pub fn deinit(self: Model, allocator: std.mem.Allocator) void {
         for (self.metadata) |kv| {
             kv.deinit(allocator);

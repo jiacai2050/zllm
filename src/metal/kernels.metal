@@ -61,6 +61,22 @@ kernel void matmul_q4_K(
     dst[i] = sum;
 }
 
+kernel void add(
+    device const float* x [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    dst[i] += x[i];
+}
+
+kernel void copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    dst[i] = src[i];
+}
+
 kernel void rope(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],

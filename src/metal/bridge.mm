@@ -68,6 +68,11 @@ void zllm_metal_release_buffer(void* buffer) {
     }
 }
 
+void* zllm_metal_get_buffer_contents(void* buffer) {
+    id<MTLBuffer> mtlBuffer = (__bridge id<MTLBuffer>)buffer;
+    return [mtlBuffer contents];
+}
+
 void zllm_metal_dispatch(ZLLM_Device* d, const char* kernel_name, void** buffers, int n_buffers, int threads) {
     @autoreleasepool {
         id<MTLFunction> func = [d->library newFunctionWithName:[NSString stringWithUTF8String:kernel_name]];

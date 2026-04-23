@@ -23,15 +23,54 @@ fn getTensorSize(dtype: u32, dims: []u64) !u64 {
     var elements: u64 = 1;
     for (dims) |d| elements *= d;
 
-    const ggml_type = std.enums.fromInt(GGMLType, dtype) orelse .F32;
+    const ggml_type = std.enums.fromInt(GGMLType, dtype) orelse {
+        std.debug.print("Unknown tensor type: {d}\n", .{dtype});
+        return error.UnknownTensorType;
+    };
+
     return switch (ggml_type) {
         .F32 => elements * 4,
         .F16 => elements * 2,
-        .Q4_K => {
-            if (elements % 256 != 0) return error.InvalidQuantizedDimensions;
-            return (elements / 256) * 144;
+        .Q4_0 => (elements / 32) * 18,
+        .Q4_1 => (elements / 32) * 20,
+        .Q5_0 => (elements / 32) * 22,
+        .Q5_1 => (elements / 32) * 24,
+        .Q8_0 => (elements / 32) * 34,
+        .Q2_K => (elements / 256) * 160,
+        .Q3_K => (elements / 256) * 112,
+        .Q4_K => (elements / 256) * 144,
+        .Q5_K => (elements / 256) * 176,
+        .Q6_K => (elements / 256) * 210,
+        else => {
+            std.debug.print("Unsupported tensor type: {s} ({d})\n", .{ @tagName(ggml_type), dtype });
+            return error.UnsupportedTensorType;
         },
-        else => elements * 4,
+    };
+}
+
+fn getMetadataUint32(model: gguf.Model, key: []const u8) !u32 {
+    const kv = model.findMetadata(key) orelse {
+        std.debug.print("Missing metadata: {s}\n", .{key});
+        return error.MissingMetadata;
+    };
+    return switch (kv.value) {
+        .uint32 => |v| v,
+        .uint64 => |v| @intCast(v),
+        .iint32 => |v| @intCast(v),
+        .iint64 => |v| @intCast(v),
+        else => error.InvalidMetadataType,
+    };
+}
+
+fn getMetadataFloat32(model: gguf.Model, key: []const u8) !f32 {
+    const kv = model.findMetadata(key) orelse {
+        std.debug.print("Missing metadata: {s}\n", .{key});
+        return error.MissingMetadata;
+    };
+    return switch (kv.value) {
+        .float32 => |v| v,
+        .float64 => |v| @floatCast(v),
+        else => error.InvalidMetadataType,
     };
 }
 
@@ -40,6 +79,34 @@ pub const Engine = struct {
     model: gguf.Model,
     tensors: std.StringArrayHashMapUnmanaged(*metal.Buffer),
     allocator: std.mem.Allocator,
+
+    // Hyperparameters
+    n_embd: u32,
+    n_layer: u32,
+    n_ff: u32,
+    n_head: u32,
+    n_head_kv: u32,
+    n_vocab: u32,
+    rms_norm_eps: f32,
+    head_dim: u32,
+
+    // Intermediate buffers
+    hidden_states: *metal.Buffer,
+    norm_states: *metal.Buffer,
+    q: *metal.Buffer,
+    k: *metal.Buffer,
+    v: *metal.Buffer,
+    mlp_gate: *metal.Buffer,
+    mlp_up: *metal.Buffer,
+    logits: *metal.Buffer,
+
+    // Scalar/Constant buffers
+    token_buf: *metal.Buffer,
+    pos_buf: *metal.Buffer,
+    eps_buf: *metal.Buffer,
+    dim_buf: *metal.Buffer,
+    head_dim_buf: *metal.Buffer,
+    freq_base_buf: *metal.Buffer,
 
     pub fn init(allocator: std.mem.Allocator, device: *metal.Device, model: gguf.Model, mmap_buffer: []const u8) !*Engine {
         var tensors: std.StringArrayHashMapUnmanaged(*metal.Buffer) = .empty;
@@ -61,12 +128,79 @@ pub const Engine = struct {
             try tensors.put(allocator, t.name.data, buf);
         }
 
+        const architecture_kv = model.findMetadata("general.architecture") orelse {
+            std.debug.print("Missing metadata: general.architecture\n", .{});
+            return error.MissingMetadata;
+        };
+        const arch = architecture_kv.value.string.data;
+        var prefix_buf: [32]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}.", .{arch});
+
+        var key_buf: [128]u8 = undefined;
+        const n_embd = try getMetadataUint32(model, try std.fmt.bufPrint(&key_buf, "{s}embedding_length", .{prefix}));
+        const n_layer = try getMetadataUint32(model, try std.fmt.bufPrint(&key_buf, "{s}block_count", .{prefix}));
+        const n_ff = try getMetadataUint32(model, try std.fmt.bufPrint(&key_buf, "{s}feed_forward_length", .{prefix}));
+        const n_head = try getMetadataUint32(model, try std.fmt.bufPrint(&key_buf, "{s}attention.head_count", .{prefix}));
+        const n_head_kv = try getMetadataUint32(model, try std.fmt.bufPrint(&key_buf, "{s}attention.head_count_kv", .{prefix}));
+        var n_vocab: u32 = 0;
+        if (model.findMetadata("llama.vocab_size")) |kv| {
+            n_vocab = kv.value.uint32;
+        } else if (model.findMetadata(try std.fmt.bufPrint(&key_buf, "{s}vocab_size", .{prefix}))) |kv| {
+            n_vocab = kv.value.uint32;
+        } else if (model.findMetadata("tokenizer.ggml.tokens")) |kv| {
+            n_vocab = @intCast(kv.value.array.len);
+        } else {
+            return error.MissingVocabSize;
+        }
+        const rms_norm_eps = try getMetadataFloat32(model, try std.fmt.bufPrint(&key_buf, "{s}attention.layer_norm_rms_epsilon", .{prefix}));
+        const head_dim = n_embd / n_head;
+
+        // Allocate intermediate buffers
+        const hidden_states = try device.createBuffer(null, n_embd * @sizeOf(f32));
+        const norm_states = try device.createBuffer(null, n_embd * @sizeOf(f32));
+        const q = try device.createBuffer(null, n_embd * @sizeOf(f32));
+        const k = try device.createBuffer(null, (n_head_kv * head_dim) * @sizeOf(f32));
+        const v = try device.createBuffer(null, (n_head_kv * head_dim) * @sizeOf(f32));
+        const mlp_gate = try device.createBuffer(null, n_ff * @sizeOf(f32));
+        const mlp_up = try device.createBuffer(null, n_ff * @sizeOf(f32));
+        const logits = try device.createBuffer(null, n_vocab * @sizeOf(f32));
+
+        // Allocate scalar buffers
+        const token_buf = try device.createBuffer(null, @sizeOf(u32));
+        const pos_buf = try device.createBuffer(null, @sizeOf(u32));
+        const eps_buf = try device.createBuffer(null, @sizeOf(f32));
+        const dim_buf = try device.createBuffer(null, @sizeOf(u32));
+        const head_dim_buf = try device.createBuffer(null, @sizeOf(u32));
+        const freq_base_buf = try device.createBuffer(null, @sizeOf(f32));
+
         const self = try allocator.create(Engine);
         self.* = Engine{
             .device = device,
             .model = model,
             .tensors = tensors,
             .allocator = allocator,
+            .n_embd = n_embd,
+            .n_layer = n_layer,
+            .n_ff = n_ff,
+            .n_head = n_head,
+            .n_head_kv = n_head_kv,
+            .n_vocab = n_vocab,
+            .rms_norm_eps = rms_norm_eps,
+            .head_dim = head_dim,
+            .hidden_states = hidden_states,
+            .norm_states = norm_states,
+            .q = q,
+            .k = k,
+            .v = v,
+            .mlp_gate = mlp_gate,
+            .mlp_up = mlp_up,
+            .logits = logits,
+            .token_buf = token_buf,
+            .pos_buf = pos_buf,
+            .eps_buf = eps_buf,
+            .dim_buf = dim_buf,
+            .head_dim_buf = head_dim_buf,
+            .freq_base_buf = freq_base_buf,
         };
         return self;
     }
@@ -77,13 +211,133 @@ pub const Engine = struct {
             entry.value_ptr.*.release();
         }
         self.tensors.deinit(self.allocator);
+
+        self.hidden_states.release();
+        self.norm_states.release();
+        self.q.release();
+        self.k.release();
+        self.v.release();
+        self.mlp_gate.release();
+        self.mlp_up.release();
+        self.logits.release();
+
+        self.token_buf.release();
+        self.pos_buf.release();
+        self.eps_buf.release();
+        self.dim_buf.release();
+        self.head_dim_buf.release();
+        self.freq_base_buf.release();
+
         self.allocator.destroy(self);
     }
 
-    pub fn forward(self: *Engine, tokens: []const u32) ![]const f32 {
+    pub fn forward(self: *Engine, token: u32, pos: u32) ![]const f32 {
+        // Update scalar buffers
+        self.setBufferValue(u32, self.token_buf, token);
+        self.setBufferValue(u32, self.pos_buf, pos);
+        self.setBufferValue(f32, self.eps_buf, self.rms_norm_eps);
+        self.setBufferValue(u32, self.dim_buf, self.n_embd);
+        self.setBufferValue(u32, self.head_dim_buf, self.head_dim);
+        self.setBufferValue(f32, self.freq_base_buf, 10000.0);
+
+        // 1. Embedding
+        const token_embd = try self.getTensor("token_embd.weight");
+        self.device.dispatch("embed", &.{ self.token_buf, self.hidden_states, token_embd, self.dim_buf }, @intCast(self.n_embd));
+
+        // 2. Transformer layers
+        for (0..self.n_layer) |i| {
+            var name_buf: [128]u8 = undefined;
+
+            // a. Attention RMSNorm
+            const attn_norm_name = try std.fmt.bufPrintZ(&name_buf, "blk.{d}.attn_norm.weight", .{i});
+            const attn_norm_weight = try self.getTensor(attn_norm_name);
+            self.device.dispatch("rms_norm", &.{ self.hidden_states, self.norm_states, attn_norm_weight, self.eps_buf }, @intCast(self.n_embd));
+
+            // b. QKV Projections
+            var q_name_buf: [128]u8 = undefined;
+            var k_name_buf: [128]u8 = undefined;
+            var v_name_buf: [128]u8 = undefined;
+            const q_name = try std.fmt.bufPrintZ(&q_name_buf, "blk.{d}.attn_q.weight", .{i});
+            const k_name = try std.fmt.bufPrintZ(&k_name_buf, "blk.{d}.attn_k.weight", .{i});
+            const v_name = try std.fmt.bufPrintZ(&v_name_buf, "blk.{d}.attn_v.weight", .{i});
+
+            const q_weight = try self.getTensor(q_name);
+            const k_weight = try self.getTensor(k_name);
+            const v_weight = try self.getTensor(v_name);
+
+            self.device.dispatch("matmul_q4_K", &.{ q_weight, self.norm_states, self.q, self.dim_buf }, @intCast(self.n_embd));
+            self.device.dispatch("matmul_q4_K", &.{ k_weight, self.norm_states, self.k, self.dim_buf }, @intCast(self.n_head_kv * self.head_dim));
+            self.device.dispatch("matmul_q4_K", &.{ v_weight, self.norm_states, self.v, self.dim_buf }, @intCast(self.n_head_kv * self.head_dim));
+
+            // c. RoPE
+            self.device.dispatch("rope", &.{ self.q, self.q, self.pos_buf, self.head_dim_buf, self.freq_base_buf }, @intCast(self.n_head * self.head_dim / 2));
+            self.device.dispatch("rope", &.{ self.k, self.k, self.pos_buf, self.head_dim_buf, self.freq_base_buf }, @intCast(self.n_head_kv * self.head_dim / 2));
+
+            // d. Attention (Trivial for single token without KV cache)
+            // For now, we just assume attn_output is v
+            // e. Output Projection
+            var attn_out_name_buf: [128]u8 = undefined;
+            const attn_out_name = try std.fmt.bufPrintZ(&attn_out_name_buf, "blk.{d}.attn_output.weight", .{i});
+            const attn_out_weight = try self.getTensor(attn_out_name);
+            self.device.dispatch("matmul_q4_K", &.{ attn_out_weight, self.v, self.norm_states, self.dim_buf }, @intCast(self.n_embd));
+
+            // f. Residual Add
+            self.device.dispatch("add", &.{ self.norm_states, self.hidden_states }, @intCast(self.n_embd));
+
+            // g. FFN RMSNorm
+            var ffn_norm_name_buf: [128]u8 = undefined;
+            const ffn_norm_name = try std.fmt.bufPrintZ(&ffn_norm_name_buf, "blk.{d}.ffn_norm.weight", .{i});
+            const ffn_norm_weight = try self.getTensor(ffn_norm_name);
+            self.device.dispatch("rms_norm", &.{ self.hidden_states, self.norm_states, ffn_norm_weight, self.eps_buf }, @intCast(self.n_embd));
+
+            // h. MLP
+            var gate_name_buf: [128]u8 = undefined;
+            var up_name_buf: [128]u8 = undefined;
+            var down_name_buf: [128]u8 = undefined;
+            const gate_name = try std.fmt.bufPrintZ(&gate_name_buf, "blk.{d}.ffn_gate.weight", .{i});
+            const up_name = try std.fmt.bufPrintZ(&up_name_buf, "blk.{d}.ffn_up.weight", .{i});
+            const down_name = try std.fmt.bufPrintZ(&down_name_buf, "blk.{d}.ffn_down.weight", .{i});
+
+            const gate_weight = try self.getTensor(gate_name);
+            const up_weight = try self.getTensor(up_name);
+            const down_weight = try self.getTensor(down_name);
+            self.device.dispatch("matmul_q4_K", &.{ gate_weight, self.norm_states, self.mlp_gate, self.dim_buf }, @intCast(self.n_ff));
+            self.device.dispatch("matmul_q4_K", &.{ up_weight, self.norm_states, self.mlp_up, self.dim_buf }, @intCast(self.n_ff));
+            self.device.dispatch("swiglu", &.{ self.mlp_gate, self.mlp_up, self.mlp_gate }, @intCast(self.n_ff));
+            
+            self.setBufferValue(u32, self.dim_buf, self.n_ff);
+            self.device.dispatch("matmul_q4_K", &.{ down_weight, self.mlp_gate, self.norm_states, self.dim_buf }, @intCast(self.n_embd));
+            self.setBufferValue(u32, self.dim_buf, self.n_embd);
+
+            // i. Residual Add
+            self.device.dispatch("add", &.{ self.norm_states, self.hidden_states }, @intCast(self.n_embd));
+        }
+
+        // 3. Final RMSNorm
+        const final_norm_weight = try self.getTensor("output_norm.weight");
+        self.device.dispatch("rms_norm", &.{ self.hidden_states, self.norm_states, final_norm_weight, self.eps_buf }, @intCast(self.n_embd));
+
+        // 4. Output Projection (Logits)
+        const lm_head = self.tensors.get("output.weight") orelse try self.getTensor("token_embd.weight");
+        self.device.dispatch("matmul_q4_K", &.{ lm_head, self.norm_states, self.logits, self.dim_buf }, @intCast(self.n_vocab));
+
+        // Read back logits
+        const logits_ptr = self.logits.getContents() orelse return error.BufferReadFailed;
+        const logits: [*]const f32 = @ptrCast(@alignCast(logits_ptr));
+        return logits[0..self.n_vocab];
+    }
+
+    fn getTensor(self: *Engine, name: []const u8) !*metal.Buffer {
+        return self.tensors.get(name) orelse {
+            std.debug.print("Tensor not found: {s}\n", .{name});
+            return error.TensorNotFound;
+        };
+    }
+
+    fn setBufferValue(self: *Engine, comptime T: type, buffer: *metal.Buffer, value: T) void {
         _ = self;
-        _ = tokens;
-        // Placeholder for now
-        return &.{};
+        const ptr = buffer.getContents() orelse return;
+        const typed_ptr: *T = @ptrCast(@alignCast(ptr));
+        typed_ptr.* = value;
     }
 };

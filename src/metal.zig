@@ -49,9 +49,14 @@ pub const Device = opaque {
 
 pub const Buffer = opaque {
     extern fn zllm_metal_release_buffer(buffer: *Buffer) void;
+    extern fn zllm_metal_get_buffer_contents(buffer: *Buffer) ?*anyopaque;
 
     pub fn release(self: *Buffer) void {
         zllm_metal_release_buffer(self);
+    }
+
+    pub fn getContents(self: *Buffer) ?*anyopaque {
+        return zllm_metal_get_buffer_contents(self);
     }
 };
 

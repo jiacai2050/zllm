@@ -35,6 +35,11 @@ void* zllm_metal_create_buffer(ZLLM_Device* d, const void* data, size_t size);
 void zllm_metal_release_buffer(void* buffer);
 
 /**
+ * Get the contents of a Metal buffer.
+ */
+void* zllm_metal_get_buffer_contents(void* buffer);
+
+/**
  * Dispatch a compute kernel.
  */
 void zllm_metal_dispatch(ZLLM_Device* d, const char* kernel_name, void** buffers, int n_buffers, int threads);

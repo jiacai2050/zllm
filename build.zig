@@ -30,6 +30,14 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addIncludePath(b.path("src/metal"));
 
+    // Tokenizer module and tests
+    const tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root_module.addImport("tokenizer", tokenizer_module);
+
     // Install the executable.
     b.installArtifact(exe);
 
@@ -88,4 +96,16 @@ pub fn build(b: *std.Build) void {
 
     const run_gguf_tests = b.addRunArtifact(gguf_tests);
     test_step.dependOn(&run_gguf_tests.step);
+
+    const tokenizer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tokenizer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tokenizer_tests.root_module.addImport("tokenizer", tokenizer_module);
+
+    const run_tokenizer_tests = b.addRunArtifact(tokenizer_tests);
+    test_step.dependOn(&run_tokenizer_tests.step);
 }
